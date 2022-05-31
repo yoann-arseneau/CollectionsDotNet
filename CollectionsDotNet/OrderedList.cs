@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading;
 
 namespace CollectionsDotNet {
@@ -19,7 +20,12 @@ namespace CollectionsDotNet {
 	}
 
 	public class OrderedList {
-		public static OrderedList<T> FromComparable<T>(NullOrdering nullOrdering = NullOrdering.Natural)
+		public static OrderedList<T> FromComparable<T, U>(Func<T, U> keySelector)
+				where U : IComparable<U> {
+			return new((x, y) => keySelector(x).CompareTo(keySelector(y)));
+		}
+		public static OrderedList<T> FromComparable<T>(
+				NullOrdering nullOrdering = NullOrdering.Natural)
 				where T : IComparable<T> {
 			var type = typeof(T);
 			if (type.IsValueType) {
@@ -44,7 +50,9 @@ namespace CollectionsDotNet {
 				};
 			}
 		}
-		public static OrderedList<T> FromComparable<T>(int initialCapacity, NullOrdering nullOrdering = NullOrdering.Natural)
+		public static OrderedList<T> FromComparable<T>(
+				int initialCapacity,
+				NullOrdering nullOrdering = NullOrdering.Natural)
 				where T : IComparable<T> {
 			if (initialCapacity < 0) {
 				throw new ArgumentOutOfRangeException(nameof(initialCapacity));
@@ -54,20 +62,23 @@ namespace CollectionsDotNet {
 			list.Capacity = initialCapacity;
 			return list;
 		}
-		public static OrderedList<T> FromComparable<T>(IEnumerable<T> items, NullOrdering nullOrdering = NullOrdering.Natural)
+		public static OrderedList<T> FromComparable<T>(
+				IEnumerable<T> items,
+				NullOrdering nullOrdering = NullOrdering.Natural)
 				where T : IComparable<T> {
 			var list = FromComparable<T>(nullOrdering);
 			list.AddRange(items);
 			return list;
 		}
 
-		public static OrderedList<T?> FromNullableComparable<T>(NullOrdering nullOrdering = NullOrdering.Natural)
+		public static OrderedList<T?> FromNullableComparable<T>(
+				NullOrdering nullOrdering = NullOrdering.Natural)
 				where T : struct, IComparable<T> {
 			return nullOrdering switch {
 				NullOrdering.Natural => new((x, y) => (x, y) switch {
 					(not null, not null) => x.Value.CompareTo(y.Value),
-					(null, not null) => throw new InvalidOperationException("cannot compare null with non-null"),
-					(not null, null) => throw new InvalidOperationException("cannot compare non-null with null"),
+					(null, not null) => throw new ArgumentNullException(nameof(x)),
+					(not null, null) => throw new ArgumentNullException(nameof(y)),
 					(null, null) => 0,
 				}),
 				NullOrdering.NullFirst => new((x, y) => (x, y) switch {
@@ -85,7 +96,9 @@ namespace CollectionsDotNet {
 				_ => throw new ArgumentException($"unexpected ordering '{nullOrdering}'", nameof(nullOrdering)),
 			};
 		}
-		public static OrderedList<T?> FromNullableComparable<T>(int initialCapacity, NullOrdering nullOrdering = NullOrdering.Natural)
+		public static OrderedList<T?> FromNullableComparable<T>(
+				int initialCapacity,
+				NullOrdering nullOrdering = NullOrdering.Natural)
 				where T : struct, IComparable<T> {
 			if (initialCapacity < 0) {
 				throw new ArgumentOutOfRangeException(nameof(initialCapacity));
@@ -95,7 +108,9 @@ namespace CollectionsDotNet {
 			list.Capacity = initialCapacity;
 			return list;
 		}
-		public static OrderedList<T?> FromNullableComparable<T>(IEnumerable<T?> items, NullOrdering nullOrdering = NullOrdering.Natural)
+		public static OrderedList<T?> FromNullableComparable<T>(
+				IEnumerable<T?> items,
+				NullOrdering nullOrdering = NullOrdering.Natural)
 				where T : struct, IComparable<T> {
 			var list = FromNullableComparable<T>(nullOrdering);
 			list.AddRange(items);
@@ -135,7 +150,8 @@ namespace CollectionsDotNet {
 		private T[] _buffer;
 		private int _count;
 		private readonly IComparer<T> _comparer;
-		private volatile int _version;
+		/// <summary>Keeps track of changes; always treat as volatile.</summary>
+		private int _version;
 
 		public OrderedList(Comparison<T> comparison)
 			: this(0, Comparer<T>.Create(comparison)) {
@@ -200,8 +216,9 @@ namespace CollectionsDotNet {
 			if (index < 0) {
 				index = -index - 1;
 			}
+			Interlocked.Increment(ref _version);
 			EnsureCapacity(_count + 1);
-			InsertAt(index, item);
+			DoInsertAt(index, item);
 		}
 		public void AddRange(IEnumerable<T> items) {
 			if (items is ICollection<T> collection && collection.Count >= 2) {
@@ -209,7 +226,13 @@ namespace CollectionsDotNet {
 					return;
 				}
 
-				EnsureCapacity(_count + collection.Count);
+				Interlocked.Increment(ref _version);
+				if (items is OrderedList<T>) {
+					// TODO optimize for pre-sorted data
+				}
+				if (EnsureCapacity(_count + collection.Count)) {
+					// TODO optimize using old array as buffer space
+				}
 				collection.CopyTo(_buffer, _count);
 				_count += collection.Count;
 				FullSort();
@@ -221,7 +244,7 @@ namespace CollectionsDotNet {
 			}
 		}
 		public void Clear() {
-			_version += 1;
+			Interlocked.Increment(ref _version);
 			Array.Clear(_buffer, 0, _count);
 			_count = 0;
 		}
@@ -231,9 +254,17 @@ namespace CollectionsDotNet {
 				return false;
 			}
 
-			_version += 1;
-			RemoveAt(index);
+			Interlocked.Increment(ref _version);
+			DoRemoveAt(index);
 			return true;
+		}
+		public void RemoveAt(int index) {
+			if (index < 0 || index >= _count) {
+				throw new ArgumentOutOfRangeException(nameof(index));
+			}
+
+			Interlocked.Increment(ref _version);
+			DoRemoveAt(index);
 		}
 
 		public void CopyTo(T[] array, int arrayIndex) => Array.Copy(_buffer, 0, array, arrayIndex, _count);
@@ -253,10 +284,10 @@ namespace CollectionsDotNet {
 		}
 
 		public IEnumerator<T> GetEnumerator() {
-			var version = _version;
+			var version = Volatile.Read(ref _version);
 			var count = Volatile.Read(ref _count);
 			for (var i = 0; i < count; ++i) {
-				if (version != _version) {
+				if (version != Volatile.Read(ref _version)) {
 					throw new InvalidOperationException("collection changed while enumerating");
 				}
 				yield return _buffer[i];
@@ -264,7 +295,7 @@ namespace CollectionsDotNet {
 		}
 
 		private int BinarySearch(T item) => Array.BinarySearch(_buffer, 0, _count, item, _comparer);
-		private void EnsureCapacity(int minimumCapacity) {
+		private bool EnsureCapacity(int minimumCapacity) {
 			if (_count < minimumCapacity) {
 				int newSize;
 				if (_count >= int.MaxValue / 2) {
@@ -275,20 +306,25 @@ namespace CollectionsDotNet {
 				}
 				var newBuf = new T[newSize];
 				Array.Copy(_buffer, newBuf, _count);
-				_version += 1;
 				_buffer = newBuf;
+				return true;
 			}
 			else {
-				_version += 1;
+				return false;
 			}
 		}
 		private void FullSort() => Array.Sort(_buffer, 0, _count, _comparer);
-		private void InsertAt(int index, T item) {
+
+		private void DoInsertAt(int index, T item) {
+			Debug.Assert(index >= 0 && index <= _count);
+
 			Array.Copy(_buffer, index, _buffer, index + 1, _count - index);
 			_buffer[index] = item;
 			_count += 1;
 		}
-		private void RemoveAt(int index) {
+		private void DoRemoveAt(int index) {
+			Debug.Assert(index >= 0 && index < _count);
+
 			var i = index;
 			for (; i < _count - 1; ++i) {
 				_buffer[i] = _buffer[i + 1];
